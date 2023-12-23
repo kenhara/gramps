@@ -212,6 +212,7 @@ class CSVParser:
                 _("Call"),
                 _("call"),
             ),
+            "tag": ("tag", _("tag"), _("Tag")),
             "title": ("title", _("title"), _("title", "Person or Place")),
             "prefix": ("prefix", _("prefix"), _("Prefix")),
             "suffix": ("suffix", _("suffix"), _("Suffix")),
@@ -576,7 +577,7 @@ class CSVParser:
                 self._parse_marriage(line_number, row, col)
             elif "family" in header:
                 self._parse_family(line_number, row, col)
-            elif "surname" in header:
+            elif any(("surname" in header, "person" in header)):
                 self._parse_person(line_number, row, col)
             elif "place" in header:
                 self._parse_place(line_number, row, col)
@@ -594,9 +595,10 @@ class CSVParser:
         marriageplace_id = rd(line_number, row, col, "place_id")
         marriagesource = rd(line_number, row, col, "source")
         note = rd(line_number, row, col, "note")
+        tag = rd(line_number, row, col, "tag")
         wife = self.lookup("person", wife)
         husband = self.lookup("person", husband)
-        if husband is None and wife is None:
+        if husband is None and wife is None and marriage_ref is None:
             # might have children, so go ahead and add
             LOG.warning("no parents on line %d; adding family anyway" % line_number)
         family = self.get_or_create_family(marriage_ref, husband, wife)
@@ -628,6 +630,7 @@ class CSVParser:
             marriagedate = _dp.parse(marriagedate)
         if marriagedate or marriageplace or marriagesource or note:
             # add, if new; replace, if different
+            # FIXME: if not adding, need to lookup
             new, marriage = self.get_or_create_event(
                 family, EventType.MARRIAGE, marriagedate, marriageplace, marriagesource
             )
@@ -637,6 +640,10 @@ class CSVParser:
                 mar_ref.set_role(EventRoleType(EventRoleType.FAMILY))
                 family.add_event_ref(mar_ref)
                 self.db.commit_family(family, self.trans)
+            # FIXME: add to existing marriage
+            if tag:
+                self.add_tag(marriage, tag)
+                self.db.commit_event(marriage, self.trans)
             # only add note to event:
             # append notes, if previous notes
             if note:
@@ -674,6 +681,7 @@ class CSVParser:
         source = rd(line_number, row, col, "source")
         note = rd(line_number, row, col, "note")
         gender = rd(line_number, row, col, "gender")
+        tag = rd(line_number, row, col, "tag")
         child = self.lookup("person", child)
         family = self.lookup("family", family_ref)
         if family is None:
@@ -682,6 +690,9 @@ class CSVParser:
                 "on line %d" % line_number
             )
             return
+        if tag is not None:
+            self.add_tag(family, tag)
+            self.db.commit_family(family, self.trans)
         if child is None:
             LOG.warning(
                 "no matching child reference found for family "
@@ -749,8 +760,9 @@ class CSVParser:
     def _parse_person(self, line_number, row, col):
         "Parse the content of a Person line."
         surname = rd(line_number, row, col, "surname")
-        firstname = rd(line_number, row, col, "firstname", "")
+        firstname = rd(line_number, row, col, "firstname")
         callname = rd(line_number, row, col, "callname")
+        tag = rd(line_number, row, col, "tag")
         title = rd(line_number, row, col, "title")
         prefix = rd(line_number, row, col, "prefix")
         suffix = rd(line_number, row, col, "suffix")
@@ -800,9 +812,11 @@ class CSVParser:
             person = self.create_person()
             name = Name()
             name.set_type(NameType(NameType.BIRTH))
-            name.set_first_name(firstname)
+            if firstname is not None:
+                name.set_first_name(firstname)
             surname_obj = Surname()
-            surname_obj.set_surname(surname)
+            if surname is not None:
+                surname_obj.set_surname(surname)
             name.add_surname(surname_obj)
             person.set_primary_name(name)
         else:
@@ -864,6 +878,8 @@ class CSVParser:
             else:
                 gender = Person.UNKNOWN
             person.set_gender(gender)
+        if tag is not None:
+            self.add_tag(person, tag)
         #########################################################
         # add if new, replace if different
         # Birth:
@@ -1036,6 +1052,7 @@ class CSVParser:
         place_code = rd(line_number, row, col, "code")
         place_enclosed_by_id = rd(line_number, row, col, "enclosed_by")
         place_date = rd(line_number, row, col, "date")
+        tag = rd(line_number, row, col, "tag")
         #########################################################
         # if this place already exists, don't create it
         place = self.lookup("place", place_id)
@@ -1048,6 +1065,8 @@ class CSVParser:
                 self.storeup("place", place_id, place)
         if place_title is not None:
             place.title = place_title
+        if tag is not None:
+            self.add_tag(place, tag)
         if place_name is not None:
             place.name = PlaceName(value=place_name)
         if place_type_str is not None:
@@ -1128,7 +1147,7 @@ class CSVParser:
             family.set_mother_handle(wife.get_handle())
             wife.add_family_handle(family.get_handle())
         if husband and wife:
-            family.set_relationship(FamilyRelType.MARRIED)
+            family.set_relationship(config.get("preferences.family-relation-type"))
         self.db.add_family(family, self.trans)
         if husband:
             self.db.commit_person(husband, self.trans)
@@ -1296,3 +1315,14 @@ class CSVParser:
             "   created citation, citation %s %s" % (citation, citation.get_gramps_id())
         )
         obj.add_citation(citation.get_handle())
+
+    def add_tag(self, obj, name):
+        """
+        Add a tag to an obj and database if it doesn't have it already
+        """
+        tag = self.db.get_tag_from_name(name)
+        if tag is None:
+            tag = Tag()
+            tag.set_name(name)
+            self.db.add_tag(tag, self.trans)
+        obj.add_tag(tag.handle)
