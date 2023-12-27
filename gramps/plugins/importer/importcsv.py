@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #
 # Gramps - a GTK+/GNOME based genealogy program
 #
@@ -24,15 +25,8 @@
 
 "Import from CSV Spreadsheet"
 
-# -------------------------------------------------------------------------
-#
-# Standard Python Modules
-#
-# -------------------------------------------------------------------------
-import time
-import csv
 import codecs
-from io import TextIOWrapper
+import csv
 
 # ------------------------------------------------------------------------
 #
@@ -41,7 +35,15 @@ from io import TextIOWrapper
 # ------------------------------------------------------------------------
 import logging
 
-LOG = logging.getLogger(".ImportCSV")
+# -------------------------------------------------------------------------
+#
+# Standard Python Modules
+#
+# -------------------------------------------------------------------------
+import time
+from io import TextIOWrapper
+
+from gramps.gen.config import config
 
 # -------------------------------------------------------------------------
 #
@@ -49,50 +51,49 @@ LOG = logging.getLogger(".ImportCSV")
 #
 # -------------------------------------------------------------------------
 from gramps.gen.const import GRAMPS_LOCALE as glocale
-
-_ = glocale.translation.sgettext
-ngettext = glocale.translation.ngettext  # else "nearby" comments are ignored
+from gramps.gen.datehandler import parser as _dp
+from gramps.gen.db import DbTxn
+from gramps.gen.display.place import displayer as place_displayer
+from gramps.gen.errors import GrampsImportError as Error
 from gramps.gen.lib import (
+    Attribute,
     ChildRef,
     Citation,
     Event,
     EventRef,
     EventType,
     Family,
-    FamilyRelType,
     Name,
     NameType,
     Note,
     NoteType,
     Person,
     Place,
+    PlaceName,
+    PlaceRef,
+    PlaceType,
     Source,
     Surname,
     Tag,
-    PlaceName,
-    PlaceType,
-    PlaceRef,
-    Attribute,
-    AttributeType,
 )
-from gramps.gen.db import DbTxn
-from gramps.gen.datehandler import parser as _dp
-from gramps.gen.utils.string import gender as gender_map
-from gramps.gen.utils.id import create_id
-from gramps.gen.utils.location import located_in
-from gramps.gen.utils.unknown import create_explanation_note
 from gramps.gen.lib.eventroletype import EventRoleType
-from gramps.gen.config import config
-from gramps.gen.display.place import displayer as place_displayer
+from gramps.gen.utils.id import create_id
 from gramps.gen.utils.libformatting import ImportInfo
-from gramps.gen.errors import GrampsImportError as Error
+from gramps.gen.utils.string import gender as gender_map
+from gramps.gen.utils.unknown import create_explanation_note
 
+LOG = logging.getLogger(".ImportCSV")
+
+_ = glocale.translation.sgettext
+ngettext = glocale.translation.ngettext  # else "nearby" comments are ignored
 
 # -------------------------------------------------------------------------
 #
 # Support Functions
 #
 # -------------------------------------------------------------------------
+
+
 def get_primary_event_ref_from_type(dbase, person, event_name):
     """
     >>> get_primary_event_ref_from_type(dbase, Person(), "Baptism"):
@@ -628,9 +629,9 @@ class CSVParser:
             marriageplace = self.lookup("place", marriageplace_id)
         if marriagedate:
             marriagedate = _dp.parse(marriagedate)
-        if marriagedate or marriageplace or marriagesource or note:
+        if marriagedate or marriageplace or marriagesource or note or tag:
+            # FIXME: adds new event if Tag only
             # add, if new; replace, if different
-            # FIXME: if not adding, need to lookup
             new, marriage = self.get_or_create_event(
                 family, EventType.MARRIAGE, marriagedate, marriageplace, marriagesource
             )
@@ -639,37 +640,13 @@ class CSVParser:
                 mar_ref.set_reference_handle(marriage.get_handle())
                 mar_ref.set_role(EventRoleType(EventRoleType.FAMILY))
                 family.add_event_ref(mar_ref)
-                self.db.commit_family(family, self.trans)
-            # FIXME: add to existing marriage
             if tag:
                 self.add_tag(marriage, tag)
-                self.db.commit_event(marriage, self.trans)
-            # only add note to event:
-            # append notes, if previous notes
             if note:
-                previous_notes_list = marriage.get_note_list()
-                updated_note = False
-                for note_handle in previous_notes_list:
-                    previous_note = self.db.get_note_from_handle(note_handle)
-                    if previous_note.type == NoteType.EVENT:
-                        previous_text = previous_note.get()
-                        if note not in previous_text:
-                            note = previous_text + "\n" + note
-                        previous_note.set(note)
-                        self.db.commit_note(previous_note, self.trans)
-                        updated_note = True
-                        break
-                if not updated_note:
-                    # add new note here
-                    new_note = Note()
-                    new_note.handle = create_id()
-                    new_note.type.set(NoteType.EVENT)
-                    new_note.set(note)
-                    if self.default_tag:
-                        new_note.add_tag(self.default_tag.handle)
-                    self.db.add_note(new_note, self.trans)
-                    marriage.add_note(new_note.handle)
-                self.db.commit_event(marriage, self.trans)
+                self.add_note(NoteType.EVENT, marriage, note)
+
+            self.db.commit_event(marriage, self.trans)
+            self.db.commit_family(family, self.trans)
 
     def _parse_family(self, line_number, row, col):
         "Parse the content of a family line"
@@ -677,12 +654,12 @@ class CSVParser:
         if family_ref is None:
             LOG.warning("no family reference found for family on line %d" % line_number)
             return  # required
-        child = rd(line_number, row, col, "child")
         source = rd(line_number, row, col, "source")
         note = rd(line_number, row, col, "note")
         gender = rd(line_number, row, col, "gender")
         tag = rd(line_number, row, col, "tag")
-        child = self.lookup("person", child)
+        child_ref = rd(line_number, row, col, "child")
+        child = self.lookup("person", child_ref)
         family = self.lookup("family", family_ref)
         if family is None:
             LOG.warning(
@@ -690,72 +667,50 @@ class CSVParser:
                 "on line %d" % line_number
             )
             return
-        if tag is not None:
-            self.add_tag(family, tag)
-            self.db.commit_family(family, self.trans)
-        if child is None:
-            LOG.warning(
-                "no matching child reference found for family "
-                "on line %d" % line_number
-            )
-            return
-        # is this child already in this family? If so, don't add
-        LOG.debug("children: %s", [ref.ref for ref in family.get_child_ref_list()])
-        LOG.debug("looking for: %s", child.get_handle())
-        if child.get_handle() not in [ref.ref for ref in family.get_child_ref_list()]:
-            # add child to family
-            LOG.debug(
-                "   adding child [%s] to family [%s]",
-                child.get_gramps_id(),
-                family.get_gramps_id(),
-            )
-            childref = ChildRef()
-            childref.set_reference_handle(child.get_handle())
-            family.add_child_ref(childref)
-            self.db.commit_family(family, self.trans)
-            child.add_parent_family_handle(family.get_handle())
-        if gender:
-            # replace
-            gender = gender.lower()
-            if gender == gender_map[Person.MALE].lower():
-                gender = Person.MALE
-            elif gender == gender_map[Person.FEMALE].lower():
-                gender = Person.FEMALE
-            elif gender == gender_map[Person.OTHER].lower():
-                gender = Person.OTHER
-            else:
-                gender = Person.UNKNOWN
-            child.set_gender(gender)
-        if source:
-            # add, if new
-            dummy_new, source = self.get_or_create_source(source)
-            self.find_and_set_citation(child, source)
-        # put note on child
-        if note:
-            # append notes, if previous notes
-            previous_notes_list = child.get_note_list()
-            updated_note = False
-            for note_handle in previous_notes_list:
-                previous_note = self.db.get_note_from_handle(note_handle)
-                if previous_note.type == NoteType.PERSON:
-                    previous_text = previous_note.get()
-                    if note not in previous_text:
-                        note = previous_text + "\n" + note
-                    previous_note.set(note)
-                    self.db.commit_note(previous_note, self.trans)
-                    updated_note = True
-                    break
-            if not updated_note:
-                # add new note here
-                new_note = Note()
-                new_note.handle = create_id()
-                new_note.type.set(NoteType.PERSON)
-                new_note.set(note)
-                if self.default_tag:
-                    new_note.add_tag(self.default_tag.handle)
-                self.db.add_note(new_note, self.trans)
-                child.add_note(new_note.handle)
-        self.db.commit_person(child, self.trans)
+        if child:
+            # is this child already in this family? If so, don't add
+            LOG.debug("children: %s", [ref.ref for ref in family.get_child_ref_list()])
+            LOG.debug("looking for: %s", child.get_handle())
+            if child.get_handle() not in [
+                ref.ref for ref in family.get_child_ref_list()
+            ]:
+                # add child to family
+                LOG.debug(
+                    "   adding child [%s] to family [%s]",
+                    child.get_gramps_id(),
+                    family.get_gramps_id(),
+                )
+                childref = ChildRef()
+                childref.set_reference_handle(child.get_handle())
+                family.add_child_ref(childref)
+                self.db.commit_family(family, self.trans)
+                child.add_parent_family_handle(family.get_handle())
+            if gender:
+                # replace
+                gender = gender.lower()
+                if gender == gender_map[Person.MALE].lower():
+                    gender = Person.MALE
+                elif gender == gender_map[Person.FEMALE].lower():
+                    gender = Person.FEMALE
+                elif gender == gender_map[Person.OTHER].lower():
+                    gender = Person.OTHER
+                else:
+                    gender = Person.UNKNOWN
+                child.set_gender(gender)
+            if source:
+                dummy_new, source = self.get_or_create_source(source)
+                self.find_and_set_citation(child, source)
+            if tag is not None:
+                self.add_tag(child, tag)
+            if note:
+                self.add_note(NoteType.PERSON, child, note)
+        else:  # not a child; note and tag refers to family
+            if tag is not None:
+                self.add_tag(family, tag)
+            if note:
+                self.add_note(NoteType.EVENT, family, note)
+
+        self.db.commit_family(family, self.trans)
 
     def _parse_person(self, line_number, row, col):
         "Parse the content of a Person line."
@@ -1326,3 +1281,34 @@ class CSVParser:
             tag.set_name(name)
             self.db.add_tag(tag, self.trans)
         obj.add_tag(tag.handle)
+
+    def add_note(self, note_type, obj, note):
+        """
+        Add a note to an object
+        """
+        previous_notes_list = obj.get_note_list()
+        updated_note = False
+        for note_handle in previous_notes_list:
+            previous_note = self.db.get_note_from_handle(note_handle)
+            if previous_note.type == note_type:
+                previous_text = previous_note.get()
+                if note not in previous_text:
+                    note = previous_text + "\n" + note
+                previous_note.set(note)
+                self.db.commit_note(previous_note, self.trans)
+                updated_note = True
+                break
+        if not updated_note:
+            new_note = Note()
+            new_note.handle = create_id()
+            new_note.type.set(note_type)
+            new_note.set(note)
+            if self.default_tag:
+                new_note.add_tag(self.default_tag.handle)
+            self.db.add_note(new_note, self.trans)
+            obj.add_note(new_note.handle)
+
+        if note_type == NoteType.Person:
+            self.db.commit_person(obj, self.trans)
+        elif note_type == NoteType.Event:
+            self.db.commit_event(obj, self.trans)
