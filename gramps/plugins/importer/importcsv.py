@@ -63,6 +63,7 @@ from gramps.gen.lib import (
     EventRef,
     EventType,
     Family,
+    FamilyRelType,
     Name,
     NameType,
     Note,
@@ -1136,7 +1137,7 @@ class CSVParser:
             family.set_mother_handle(wife.get_handle())
             wife.add_family_handle(family.get_handle())
         if husband and wife:
-            family.set_relationship(config.get("preferences.family-relation-type"))
+            family.set_relationship(FamilyRelType.MARRIED)
         self.db.add_family(family, self.trans)
         if husband:
             self.db.commit_person(husband, self.trans)
