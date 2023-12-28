@@ -180,6 +180,7 @@ class CSVParser:
         self.pref = {}  # person ref, internal to this sheet
         self.fref = {}  # family ref, internal to this sheet
         self.placeref = {}
+        self.eventref = {}
         self.place_types = {}
         # Build reverse dictionary, name to type number
         for items in PlaceType().get_map().items():  # (0, 'Custom')
@@ -474,6 +475,20 @@ class CSVParser:
                     return self.placeref[id_.lower()]
                 else:
                     return None
+        elif type_ == "event":
+            if id_.startswith("[") and id_.endswith("]"):
+                id_ = self.db.eid2user_format(id_[1:-1])
+                db_lookup = self.db.get_event_from_gramps_id(id_)
+                if db_lookup is None:
+                    return self.lookup(type_, id_)
+                else:
+                    return db_lookup
+            else:
+                id_ = self.db.eid2user_format(id_)
+                if id_.lower() in self.eventref:
+                    return self.eventref[id_.lower()]
+                else:
+                    return None
         else:
             LOG.warning("invalid lookup type in CSV import: '%s'" % type_)
             return None
@@ -556,6 +571,7 @@ class CSVParser:
         self.pref = {}  # person ref, internal to this sheet
         self.fref = {}  # family ref, internal to this sheet
         self.placeref = {}
+        self.eventref = {}
         header = None
         line_number = 0
         for row in data:
@@ -599,9 +615,28 @@ class CSVParser:
         tag = rd(line_number, row, col, "tag")
         wife = self.lookup("person", wife)
         husband = self.lookup("person", husband)
+
+        if (
+            husband is None
+            and wife is None
+            and (tag is not None or note is not None)
+            and marriage_ref is not None
+        ):
+            # Just adding a note or tag to a marriage event
+            marriage = self.lookup("event", marriage_ref)
+            if tag:
+                self.add_tag(marriage, tag)
+            if note:
+                self.add_note(NoteType.MARRIAGE, marriage, note)
+            self.db.commit_event(marriage, self.trans)
+            return
+
+        # Below, we assume editing/creating a family
+
         if husband is None and wife is None and marriage_ref is None:
             # might have children, so go ahead and add
             LOG.warning("no parents on line %d; adding family anyway" % line_number)
+
         family = self.get_or_create_family(marriage_ref, husband, wife)
         # adjust gender, if not already provided
         if husband:
@@ -629,8 +664,7 @@ class CSVParser:
             marriageplace = self.lookup("place", marriageplace_id)
         if marriagedate:
             marriagedate = _dp.parse(marriagedate)
-        if marriagedate or marriageplace or marriagesource or note or tag:
-            # FIXME: adds new event if Tag only
+        if marriagedate or marriageplace or marriagesource:
             # add, if new; replace, if different
             new, marriage = self.get_or_create_event(
                 family, EventType.MARRIAGE, marriagedate, marriageplace, marriagesource
@@ -643,10 +677,10 @@ class CSVParser:
             if tag:
                 self.add_tag(marriage, tag)
             if note:
-                self.add_note(NoteType.EVENT, marriage, note)
-
+                self.add_note(NoteType.MARRIAGE, marriage, note)
             self.db.commit_event(marriage, self.trans)
-            self.db.commit_family(family, self.trans)
+
+        self.db.commit_family(family, self.trans)
 
     def _parse_family(self, line_number, row, col):
         "Parse the content of a family line"
@@ -1312,3 +1346,5 @@ class CSVParser:
             self.db.commit_person(obj, self.trans)
         elif note_type == NoteType.Event:
             self.db.commit_event(obj, self.trans)
+        elif note_type == NoteType.Family:
+            self.db.commit_family(obj, self.trans)
