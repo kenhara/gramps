@@ -739,6 +739,9 @@ class CSVParser:
                 self.add_tag(child, tag)
             if note:
                 self.add_note(NoteType.PERSON, child, note)
+
+            self.db.commit_person(child, self.trans)
+
         else:  # not a child; note and tag refers to family
             if tag is not None:
                 self.add_tag(family, tag)
